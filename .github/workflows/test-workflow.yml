@@ -1,0 +1,462 @@
+name: Publish prebuilts to GitHub Pages
+
+# Build U-Boot, Mesa, pipa firmware, adaptation RPMs, and mirror the kernel once;
+# publish under https://pad6-dev.github.io/sailfish-pipa/{adaptation,prebuilts}/
+# Enable: Settings → Pages → GitHub Actions. Then run this before the image workflow.
+#
+# Each heavy job restores outputs from actions/cache when its source inputs are
+# unchanged (skip rebuild). workflow_dispatch still reuses cache unless sources change.
+on:
+  workflow_dispatch:
+  push:
+    branches: [master, main]
+    paths:
+      - "u-boot-pipa/**"
+      - "mesa-pipa/**"
+      - "firmware-pipa/**"
+      - "bootstrap/**"
+      - "pkgs/**"
+      - "droid-config-pipa/**"
+      - "droid-hal-version-pipa/**"
+      - "kernel-adaptation-pipa/**"
+      - "scripts/stage-pages.sh"
+      - "scripts/stage-adaptation-pages.sh"
+      - "scripts/createrepo-local.sh"
+      - ".github/workflows/publish-prebuilts.yml"
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: sailfish-pipa-pages
+  cancel-in-progress: true
+
+env:
+  SDK_IMAGE: coderus/sailfishos-platform-sdk-base:4.6.0.13
+  MESA_SDK_IMAGE: coderus/sailfishos-platform-sdk:5.0.0.43
+  SFOS_SDK_RELEASE: "5.0.0.43"
+  # SoftISP camera bring-up (pipa-pkgs 6437f09) + makepkg patch layout (5e5527ee)
+  KERNEL_PKG_URL: https://thespider2.github.io/pipa-pkgs/repo/linux-pipa-7.1.4-5-aarch64.pkg.tar.xz
+  PAGES_BASE: https://pad6-dev.github.io/sailfish-pipa
+
+jobs:
+  build-uboot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache U-Boot output
+        id: cache-uboot
+        uses: actions/cache@v4
+        with:
+          path: u-boot-pipa/out
+          key: uboot-${{ hashFiles('u-boot-pipa/build-uboot.sh', 'u-boot-pipa/mkbootimg.py', 'u-boot-pipa/*.cfg', 'u-boot-pipa/*.config', 'u-boot-pipa/**/*.patch') }}
+      - name: Install toolchain
+        if: steps.cache-uboot.outputs.cache-hit != 'true'
+        run: |
+          set -eux
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            make bison flex python3 python3-setuptools \
+            swig libssl-dev libgnutls28-dev bc git gzip
+      - name: Build U-Boot
+        if: steps.cache-uboot.outputs.cache-hit != 'true'
+        run: |
+          set -eux
+          chmod +x u-boot-pipa/build-uboot.sh
+          CROSS_COMPILE=aarch64-linux-gnu- bash u-boot-pipa/build-uboot.sh
+          test -s u-boot-pipa/out/u-boot-xiaomi-pipa.img
+      - name: Verify U-Boot artifact
+        run: test -s u-boot-pipa/out/u-boot-xiaomi-pipa.img
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pub-uboot
+          path: u-boot-pipa/out/u-boot-xiaomi-pipa.img
+          if-no-files-found: error
+          retention-days: 7
+
+  build-mesa:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache Mesa tarball
+        id: cache-mesa
+        uses: actions/cache@v4
+        with:
+          path: mesa-pipa/out
+          key: mesa-${{ hashFiles('mesa-pipa/build-mesa-freedreno.sh', 'mesa-pipa/include/**') }}-sdk${{ env.SFOS_SDK_RELEASE }}
+      - name: Build Mesa inside SFOS Platform SDK (sb2 aarch64)
+        if: steps.cache-mesa.outputs.cache-hit != 'true'
+        run: |
+          set -eux
+          chmod +x mesa-pipa/build-mesa-freedreno.sh
+          SDK_IMAGE="$MESA_SDK_IMAGE" \
+          SFOS_SDK_RELEASE="$SFOS_SDK_RELEASE" \
+            bash mesa-pipa/build-mesa-freedreno.sh
+          test -s mesa-pipa/out/mesa-freedreno-sfos-aarch64.tar.gz
+          tar -tzf mesa-pipa/out/mesa-freedreno-sfos-aarch64.tar.gz | grep -E 'dri/msm_dri\.so$'
+      - name: Verify Mesa artifact
+        run: |
+          set -eux
+          test -s mesa-pipa/out/mesa-freedreno-sfos-aarch64.tar.gz
+          tar -tzf mesa-pipa/out/mesa-freedreno-sfos-aarch64.tar.gz | grep -E 'dri/msm_dri\.so$'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pub-mesa
+          path: mesa-pipa/out/mesa-freedreno-sfos-aarch64.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  build-firmware:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache firmware tarball
+        id: cache-fw
+        uses: actions/cache@v4
+        with:
+          path: firmware-pipa/out
+          key: firmware-${{ hashFiles('firmware-pipa/build-firmware-tarball.sh', 'firmware-pipa/*.files') }}
+      - name: Pack firmware tarball
+        if: steps.cache-fw.outputs.cache-hit != 'true'
+        run: |
+          set -eux
+          chmod +x firmware-pipa/build-firmware-tarball.sh
+          bash firmware-pipa/build-firmware-tarball.sh
+          test -s firmware-pipa/out/xiaomi-pipa-firmware.tar.gz
+      - name: Verify firmware artifact
+        run: test -s firmware-pipa/out/xiaomi-pipa-firmware.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pub-firmware
+          path: firmware-pipa/out/xiaomi-pipa-firmware.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  build-adaptation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      # hashFiles fails on sparse systemd wants→/usr/lib (broken in the tree).
+      - name: Hash adaptation inputs
+        id: adapt-hash
+        run: |
+          set -eux
+          {
+            find bootstrap/build-rpms.sh bootstrap/rpm \
+              droid-hal-version-pipa \
+              droid-config-pipa/sparse droid-config-pipa/patterns droid-config-pipa/rpm \
+              \( -type f -o -type l \) -print0 2>/dev/null \
+              | sort -z \
+              | while IFS= read -r -d '' p; do
+                  if [ -L "$p" ]; then
+                    printf 'link %s -> %s\n' "$p" "$(readlink "$p")"
+                  else
+                    sha256sum "$p"
+                  fi
+                done
+          } | sha256sum | awk '{print $1}' | tee /tmp/adapt.hash
+          echo "hash=$(cat /tmp/adapt.hash)" >> "$GITHUB_OUTPUT"
+      - name: Cache bootstrap adaptation RPMs
+        id: cache-adapt
+        uses: actions/cache@v4
+        with:
+          path: repo/adaptation
+          key: adaptation-${{ steps.adapt-hash.outputs.hash }}-sdkbase-${{ env.SFOS_SDK_RELEASE }}
+      - name: Sync sparse into bootstrap
+        if: steps.cache-adapt.outputs.cache-hit != 'true'
+        run: |
+          set -eux
+          rm -rf bootstrap/droid-config-pipa/sparse
+          cp -a droid-config-pipa/sparse bootstrap/droid-config-pipa/sparse
+      - name: Build bootstrap adaptation RPMs
+        if: steps.cache-adapt.outputs.cache-hit != 'true'
+        run: |
+          set -eux
+          docker pull "$SDK_IMAGE"
+          docker run --rm --privileged \
+            -v "$GITHUB_WORKSPACE:/sailfish-pipa" \
+            -w /sailfish-pipa \
+            "$SDK_IMAGE" \
+            bash -lc '
+              set -eux
+              mkdir -p repo/adaptation
+              zypper -n in createrepo_c rpm-build tar gzip || true
+              ./bootstrap/build-rpms.sh
+              test -n "$(find repo/adaptation -name "droid-hal-version-pipa-*.noarch.rpm")"
+              test -n "$(find repo/adaptation -name "droid-config-pipa-*.noarch.rpm")"
+              test -n "$(find repo/adaptation -name "droid-config-pipa-pulseaudio-settings-*.noarch.rpm")"
+              test -n "$(find repo/adaptation -name "droid-config-pipa-policy-settings-*.noarch.rpm")"
+              test -n "$(find repo/adaptation -name "patterns-sailfish-device-configuration-pipa-*.noarch.rpm")"
+              createrepo_c repo/adaptation || createrepo repo/adaptation
+            '
+      - name: Verify adaptation RPMs
+        run: |
+          set -eux
+          test -n "$(find repo/adaptation -name "droid-hal-version-pipa-*.noarch.rpm")"
+          test -n "$(find repo/adaptation -name "droid-config-pipa-*.noarch.rpm")"
+          test -n "$(find repo/adaptation -name "droid-config-pipa-pulseaudio-settings-*.noarch.rpm")"
+          test -n "$(find repo/adaptation -name "droid-config-pipa-policy-settings-*.noarch.rpm")"
+          test -n "$(find repo/adaptation -name "patterns-sailfish-device-configuration-pipa-*.noarch.rpm")"
+          ls -lh repo/adaptation
+          rpm -qp --obsoletes repo/adaptation/droid-config-pipa-policy-settings-*.noarch.rpm | grep -F ohm-configs-default
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pub-adaptation
+          path: repo/adaptation/
+          if-no-files-found: error
+          retention-days: 7
+
+  build-pkgs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    needs: [build-firmware, build-mesa]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download firmware tarball
+        uses: actions/download-artifact@v4
+        with:
+          name: pub-firmware
+          path: firmware-pipa/out
+      - name: Download Mesa tarball
+        uses: actions/download-artifact@v4
+        with:
+          name: pub-mesa
+          path: mesa-pipa/out
+      - name: Cache pipa-qcom-userspace RPM
+        id: cache-qcom
+        uses: actions/cache@v4
+        with:
+          path: pkgs/pipa-qcom-userspace/out
+          key: pipa-qcom-${{ hashFiles('pkgs/pipa-qcom-userspace/build-in-sdk.sh', 'pkgs/pipa-qcom-userspace/rpm/**', 'pkgs/pipa-qcom-userspace/files/**') }}-sdk${{ env.SFOS_SDK_RELEASE }}
+      - name: Cache pipa-hexagonrpc RPM
+        id: cache-hex
+        uses: actions/cache@v4
+        with:
+          path: pkgs/pipa-hexagonrpc/out
+          key: pipa-hex-${{ hashFiles('pkgs/pipa-hexagonrpc/build-in-sdk.sh', 'pkgs/pipa-hexagonrpc/rpm/**', 'pkgs/pipa-hexagonrpc/files/**') }}-sdk${{ env.SFOS_SDK_RELEASE }}
+      - name: Cache libssc RPM
+        id: cache-libssc
+        uses: actions/cache@v4
+        with:
+          path: pkgs/libssc/out
+          key: libssc-${{ hashFiles('pkgs/libssc/build-in-sdk.sh', 'pkgs/libssc/rpm/**', 'pkgs/libssc/files/**', 'pkgs/libssc/generated/**') }}-sdk${{ env.SFOS_SDK_RELEASE }}
+      - name: Cache sensorfw-qt5-libssc RPM
+        id: cache-sensorfw-ssc
+        uses: actions/cache@v4
+        with:
+          path: pkgs/sensorfw-qt5-libssc/out
+          key: sensorfw-ssc-${{ hashFiles('pkgs/sensorfw-qt5-libssc/build-in-sdk.sh', 'pkgs/sensorfw-qt5-libssc/rpm/**', 'pkgs/sensorfw-qt5-libssc/src/**', 'pkgs/libssc/build-in-sdk.sh', 'pkgs/libssc/rpm/**', 'pkgs/libssc/files/libssc.pc', 'pkgs/libssc/include/**') }}-sdk${{ env.SFOS_SDK_RELEASE }}
+      - name: Cache libcamera RPM
+        id: cache-libcamera
+        uses: actions/cache@v4
+        with:
+          path: pkgs/libcamera/out
+          key: libcamera-${{ hashFiles('pkgs/libcamera/build-in-sdk.sh', 'pkgs/libcamera/rpm/**', 'pkgs/libcamera/patches/**', 'pkgs/libcamera/files/**') }}-sdk${{ env.SFOS_SDK_RELEASE }}
+      - name: Cache plymouth-lite RPMs
+        id: cache-plymouth
+        uses: actions/cache@v4
+        with:
+          path: pkgs/plymouth-lite/out
+          key: plymouth-lite-${{ hashFiles('pkgs/plymouth-lite/build-in-sdk.sh', 'pkgs/plymouth-lite/rpm/**') }}-sdk${{ env.SFOS_SDK_RELEASE }}
+      - name: Cache firmware-pipa RPM
+        id: cache-fw-rpm
+        uses: actions/cache@v4
+        with:
+          path: pkgs/firmware-pipa/out
+          key: firmware-rpm-${{ hashFiles('pkgs/firmware-pipa/pack-rpm.sh', 'pkgs/firmware-pipa/rpm/**', 'firmware-pipa/build-firmware-tarball.sh', 'firmware-pipa/*.files') }}
+      - name: Cache kernel-adaptation-pipa RPM
+        id: cache-kernel-rpm
+        uses: actions/cache@v4
+        with:
+          path: kernel-adaptation-pipa/out
+          key: kernel-adapt-${{ hashFiles('kernel-adaptation-pipa/scripts/**', 'kernel-adaptation-pipa/rpm/**') }}-${{ env.KERNEL_PKG_URL }}
+      - name: Cache mesa-pipa RPM
+        id: cache-mesa-rpm
+        uses: actions/cache@v4
+        with:
+          path: pkgs/mesa-pipa/out
+          key: mesa-rpm-${{ hashFiles('pkgs/mesa-pipa/pack-rpm.sh', 'pkgs/mesa-pipa/rpm/**', 'mesa-pipa/build-mesa-freedreno.sh', 'mesa-pipa/include/**') }}-sdk${{ env.SFOS_SDK_RELEASE }}
+      - name: Build pipa-qcom-userspace (SFOS SDK sb2)
+        if: steps.cache-qcom.outputs.cache-hit != 'true'
+        run: |
+          set -eux
+          chmod +x pkgs/pipa-qcom-userspace/build-in-sdk.sh
+          SFOS_SDK_RELEASE="$SFOS_SDK_RELEASE" SDK_IMAGE="$MESA_SDK_IMAGE" \
+            bash pkgs/pipa-qcom-userspace/build-in-sdk.sh
+          test -n "$(find pkgs/pipa-qcom-userspace/out -name 'pipa-qcom-userspace*.rpm')"
+      - name: Build pipa-hexagonrpc (SFOS SDK sb2)
+        if: steps.cache-hex.outputs.cache-hit != 'true'
+        run: |
+          set -eux
+          chmod +x pkgs/pipa-hexagonrpc/build-in-sdk.sh
+          SFOS_SDK_RELEASE="$SFOS_SDK_RELEASE" SDK_IMAGE="$MESA_SDK_IMAGE" \
+            bash pkgs/pipa-hexagonrpc/build-in-sdk.sh
+          test -n "$(find pkgs/pipa-hexagonrpc/out -name 'pipa-hexagonrpc*.rpm')"
+      - name: Build libssc (SFOS SDK sb2)
+        if: steps.cache-libssc.outputs.cache-hit != 'true'
+        run: |
+          set -eux
+          chmod +x pkgs/libssc/build-in-sdk.sh
+          SFOS_SDK_RELEASE="$SFOS_SDK_RELEASE" SDK_IMAGE="$MESA_SDK_IMAGE" \
+            bash pkgs/libssc/build-in-sdk.sh
+          test -n "$(find pkgs/libssc/out -name 'libssc-0*.rpm')"
+          test -n "$(find pkgs/libssc/out -name 'libssc-devel*.rpm')"
+      - name: Build sensorfw-qt5-libssc (SFOS SDK sb2)
+        if: steps.cache-sensorfw-ssc.outputs.cache-hit != 'true'
+        run: |
+          set -eux
+          chmod +x pkgs/sensorfw-qt5-libssc/build-in-sdk.sh
+          # Needs libssc (+ devel) from previous step / cache
+          test -n "$(find pkgs/libssc/out -name 'libssc-0*.rpm')"
+          test -n "$(find pkgs/libssc/out -name 'libssc-devel*.rpm')"
+          SFOS_SDK_RELEASE="$SFOS_SDK_RELEASE" SDK_IMAGE="$MESA_SDK_IMAGE" \
+            bash pkgs/sensorfw-qt5-libssc/build-in-sdk.sh
+          test -n "$(find pkgs/sensorfw-qt5-libssc/out -name 'sensorfw-qt5-libssc*.rpm')"
+      - name: Build libcamera (SFOS SDK sb2)
+        if: steps.cache-libcamera.outputs.cache-hit != 'true'
+        run: |
+          set -eux
+          chmod +x pkgs/libcamera/build-in-sdk.sh
+          SFOS_SDK_RELEASE="$SFOS_SDK_RELEASE" SDK_IMAGE="$MESA_SDK_IMAGE" \
+            bash pkgs/libcamera/build-in-sdk.sh
+          test -n "$(find pkgs/libcamera/out -name 'libcamera-0*.rpm')"
+          test -n "$(find pkgs/libcamera/out -name 'libcamera-ipa*.rpm')"
+          test -n "$(find pkgs/libcamera/out -name 'libcamera-tools*.rpm')"
+          test -n "$(find pkgs/libcamera/out -name 'gstreamer1.0-plugin-libcamera*.rpm')"
+      - name: Build plymouth-lite (SFOS SDK sb2)
+        if: steps.cache-plymouth.outputs.cache-hit != 'true'
+        run: |
+          set -eux
+          chmod +x pkgs/plymouth-lite/build-in-sdk.sh
+          SFOS_SDK_RELEASE="$SFOS_SDK_RELEASE" SDK_IMAGE="$MESA_SDK_IMAGE" \
+            bash pkgs/plymouth-lite/build-in-sdk.sh
+          test -n "$(find pkgs/plymouth-lite/out -name 'plymouth-lite-0*.rpm')"
+          test -n "$(find pkgs/plymouth-lite/out -name 'plymouth-lite-theme-default*.rpm')"
+      - name: Pack firmware-pipa RPM
+        if: steps.cache-fw-rpm.outputs.cache-hit != 'true'
+        run: |
+          set -eux
+          chmod +x pkgs/firmware-pipa/pack-rpm.sh
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rpm
+          bash pkgs/firmware-pipa/pack-rpm.sh
+          test -n "$(find pkgs/firmware-pipa/out -name 'firmware-pipa*.rpm')"
+      - name: Pack kernel-adaptation-pipa RPM (real Image)
+        if: steps.cache-kernel-rpm.outputs.cache-hit != 'true'
+        run: |
+          set -eux
+          chmod +x kernel-adaptation-pipa/scripts/pack-rpm.sh
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rpm cpio zstd
+          KERNEL_PKG="$KERNEL_PKG_URL" bash kernel-adaptation-pipa/scripts/pack-rpm.sh
+          test -n "$(find kernel-adaptation-pipa/out -name 'kernel-adaptation-pipa-7*.rpm')"
+          # Guard: packaged Image must be a real kernel, not the old stub
+          tmp=$(mktemp -d)
+          rpm2cpio kernel-adaptation-pipa/out/kernel-adaptation-pipa-7*.rpm | (cd "$tmp" && cpio -idm --quiet)
+          test "$(wc -c < "$tmp/boot/Image")" -ge 1000000
+          # Panel must be builtin (modules.builtin) or plain .ko (not .ko.zst)
+          ( find "$tmp/lib/modules" -name 'panel-novatek-nt36532.ko' | grep -q . \
+            || grep -q 'panel-novatek-nt36532' "$tmp"/lib/modules/*/modules.builtin )
+          ! find "$tmp/lib/modules" -name 'panel-novatek-nt36532.ko.zst' | grep -q .
+          rm -rf "$tmp"
+      - name: Pack mesa-pipa RPM
+        if: steps.cache-mesa-rpm.outputs.cache-hit != 'true'
+        run: |
+          set -eux
+          chmod +x pkgs/mesa-pipa/pack-rpm.sh
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rpm
+          bash pkgs/mesa-pipa/pack-rpm.sh
+          test -n "$(find pkgs/mesa-pipa/out -name 'mesa-pipa*.rpm')"
+      - name: Verify cached/built pkgs
+        run: |
+          set -eux
+          test -n "$(find pkgs/pipa-qcom-userspace/out -name 'pipa-qcom-userspace*.rpm')"
+          test -n "$(find pkgs/pipa-hexagonrpc/out -name 'pipa-hexagonrpc*.rpm')"
+          test -n "$(find pkgs/libssc/out -name 'libssc-0*.rpm')"
+          test -n "$(find pkgs/libssc/out -name 'libssc-devel*.rpm')"
+          test -n "$(find pkgs/sensorfw-qt5-libssc/out -name 'sensorfw-qt5-libssc*.rpm')"
+          test -n "$(find pkgs/libcamera/out -name 'libcamera-0*.rpm')"
+          test -n "$(find pkgs/libcamera/out -name 'gstreamer1.0-plugin-libcamera*.rpm')"
+          test -n "$(find pkgs/plymouth-lite/out -name 'plymouth-lite-0*.rpm')"
+          test -n "$(find pkgs/plymouth-lite/out -name 'plymouth-lite-theme-default*.rpm')"
+          test -n "$(find pkgs/firmware-pipa/out -name 'firmware-pipa*.rpm')"
+          test -n "$(find pkgs/mesa-pipa/out -name 'mesa-pipa*.rpm')"
+          test -n "$(find kernel-adaptation-pipa/out -name 'kernel-adaptation-pipa-7*.rpm')"
+          rpm -qp --provides pkgs/mesa-pipa/out/mesa-pipa*.rpm | grep -F 'libGLESv2.so.2()(64bit)'
+          rpm -qp --provides pkgs/plymouth-lite/out/plymouth-lite-theme-default*.rpm | grep -F boot-splash-screen
+          ls -lh pkgs/pipa-qcom-userspace/out pkgs/pipa-hexagonrpc/out pkgs/libssc/out pkgs/sensorfw-qt5-libssc/out pkgs/libcamera/out pkgs/plymouth-lite/out pkgs/firmware-pipa/out pkgs/mesa-pipa/out kernel-adaptation-pipa/out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pub-pkgs
+          path: |
+            pkgs/pipa-qcom-userspace/out/*.rpm
+            pkgs/pipa-hexagonrpc/out/*.rpm
+            pkgs/libssc/out/*.rpm
+            pkgs/sensorfw-qt5-libssc/out/*.rpm
+            pkgs/libcamera/out/*.rpm
+            pkgs/plymouth-lite/out/*.rpm
+            pkgs/firmware-pipa/out/*.rpm
+            pkgs/mesa-pipa/out/*.rpm
+            kernel-adaptation-pipa/out/*.rpm
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: [build-uboot, build-mesa, build-firmware, build-adaptation, build-pkgs]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: _arts
+      - name: Assemble prebuilts + adaptation
+        run: |
+          set -eux
+          mkdir -p out/prebuilts repo/adaptation
+          cp -a _arts/pub-adaptation/. repo/adaptation/
+          # Drop any leftover placeholder kernel RPM from bootstrap (tiny stub Image).
+          rm -f repo/adaptation/kernel-adaptation-pipa-6*.rpm
+          find _arts/pub-pkgs -name '*.rpm' -exec cp -f {} repo/adaptation/ \;
+          # Real kernel must be present and large.
+          test -n "$(find repo/adaptation -name 'kernel-adaptation-pipa-7*.rpm')"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq createrepo-c rpm cpio || sudo apt-get install -y -qq createrepo rpm cpio
+          tmp=$(mktemp -d)
+          rpm2cpio repo/adaptation/kernel-adaptation-pipa-7*.rpm | (cd "$tmp" && cpio -idm --quiet)
+          test "$(wc -c < "$tmp/boot/Image")" -ge 1000000
+          rm -rf "$tmp"
+          createrepo_c repo/adaptation || createrepo repo/adaptation
+          cp -f _arts/pub-uboot/u-boot-xiaomi-pipa.img out/prebuilts/
+          cp -f _arts/pub-mesa/mesa-freedreno-sfos-aarch64.tar.gz out/prebuilts/
+          cp -f _arts/pub-firmware/xiaomi-pipa-firmware.tar.gz out/prebuilts/
+          wget -q --show-progress -O "out/prebuilts/$(basename "$KERNEL_PKG_URL")" "$KERNEL_PKG_URL"
+          test -s "out/prebuilts/$(basename "$KERNEL_PKG_URL")"
+          ls -lh out/prebuilts repo/adaptation
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+      - name: Stage Pages site
+        env:
+          GIT_SHA: ${{ github.sha }}
+        run: |
+          chmod +x scripts/stage-pages.sh
+          ./scripts/stage-pages.sh
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: site
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@v5
