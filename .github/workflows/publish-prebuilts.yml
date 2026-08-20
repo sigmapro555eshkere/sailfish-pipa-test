@@ -38,7 +38,7 @@ env:
   MESA_SDK_IMAGE: coderus/sailfishos-platform-sdk:5.0.0.43
   SFOS_SDK_RELEASE: "5.0.0.43"
   # SoftISP camera bring-up (pipa-pkgs 6437f09) + makepkg patch layout (5e5527ee)
-  KERNEL_PKG_URL: https://thespider2.github.io/pipa-pkgs/repo/linux-pipa-7.1.0-4-aarch64.pkg.tar.xz
+  KERNEL_PKG_URL: https://thespider2.github.io/pipa-pkgs/repo/linux-pipa-7.1.4-5-aarch64.pkg.tar.xz
   PAGES_BASE: https://pad6-dev.github.io/sailfish-pipa
 
 jobs:
